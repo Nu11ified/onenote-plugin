@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "onenote": {
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/scripts/onenote-mcp.js"],
+      "env": {
+        "ONENOTE_TENANT_ID": "common",
+        "ONENOTE_SCOPES": "Notes.ReadWrite offline_access User.Read"
+      }
+    }
+  }
+}
