@@ -21,12 +21,6 @@ codex plugin marketplace upgrade onenote-plugin
 
 Then restart Codex, open Plugins, select the OneNote Plugin marketplace, and install `onenote-plugin`.
 
-You can also install it from the CLI after adding the marketplace:
-
-```sh
-codex plugin add onenote-plugin@onenote-plugin
-```
-
 ## Setup
 
 Create a Microsoft Entra app registration configured as a public client, then grant delegated Microsoft Graph permissions:

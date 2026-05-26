@@ -1,0 +1,24 @@
+{
+  "name": "onenote-plugin",
+  "version": "0.1.0",
+  "description": "Access and update OneNote notebooks through Microsoft Graph.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "OneNote",
+    "shortDescription": "Read, create, and update OneNote pages.",
+    "longDescription": "Use delegated Microsoft Graph access to search notebooks, inspect pages, and create structured OneNote content from Codex.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Interactive"],
+    "brandColor": "#7719AA",
+    "defaultPrompt": [
+      "Create a OneNote meeting page.",
+      "Find my recent OneNote project notes.",
+      "Append action items to a OneNote page."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
