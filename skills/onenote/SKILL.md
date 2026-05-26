@@ -14,11 +14,11 @@ The bundled MCP server uses Microsoft Graph delegated authentication. App-only O
 Before using notebook tools:
 
 1. Check auth with `onenote_auth_status`.
-2. If not signed in, call `onenote_auth_start`.
-3. Tell the user to open the returned verification URL and enter the returned user code.
-4. Call `onenote_auth_complete` after the user signs in.
+2. If not signed in and a browser is available, call `onenote_login`.
+3. Tell the user to complete the Microsoft browser sign-in window.
+4. Use `onenote_auth_start` and `onenote_auth_complete` only as a fallback for environments where browser login cannot open.
 
-The OAuth app must be a Microsoft Entra public client with delegated Graph permissions for `Notes.ReadWrite`, `offline_access`, and `User.Read`. The client ID can be supplied with the `ONENOTE_CLIENT_ID` environment variable or as the `clientId` argument to `onenote_auth_start`.
+The OAuth app must be a Microsoft Entra public client with delegated Graph permissions for `Notes.ReadWrite`, `offline_access`, and `User.Read`. It must allow `http://localhost` as a redirect URI for browser-based PKCE sign-in. The client ID can be supplied with the `ONENOTE_CLIENT_ID` environment variable or as the `clientId` argument to `onenote_login`.
 
 ## Structured Workflows
 

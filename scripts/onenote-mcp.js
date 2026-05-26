@@ -2,8 +2,11 @@
 "use strict";
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const { execFile, execFileSync } = require("node:child_process");
 
 const GRAPH_ROOT = "https://graph.microsoft.com/v1.0";
 const DEFAULT_TENANT = process.env.ONENOTE_TENANT_ID || "common";
@@ -14,6 +17,8 @@ const DATA_DIR =
   path.join(os.homedir(), ".codex-onenote-plugin");
 const TOKEN_PATH = path.join(DATA_DIR, "token.json");
 const PENDING_AUTH_PATH = path.join(DATA_DIR, "pending-auth.json");
+const KEYCHAIN_SERVICE = "codex-onenote-plugin";
+const DEFAULT_LOGIN_TIMEOUT_SECONDS = 180;
 
 const tools = [
   {
@@ -23,11 +28,21 @@ const tools = [
   },
   {
     name: "onenote_auth_start",
-    description: "Start Microsoft device-code sign-in for OneNote delegated Graph access.",
+    description: "Start Microsoft device-code sign-in for OneNote delegated Graph access. Prefer onenote_login when a browser is available.",
     inputSchema: objectSchema({
       clientId: stringProp("Microsoft Entra application client ID. Defaults to ONENOTE_CLIENT_ID."),
       tenantId: stringProp("Tenant ID or common/organizations/consumers. Defaults to ONENOTE_TENANT_ID or common."),
       scopes: stringProp("Space-delimited delegated Graph scopes. Defaults to Notes.ReadWrite offline_access User.Read.")
+    })
+  },
+  {
+    name: "onenote_login",
+    description: "Open a browser-based Microsoft sign-in using OAuth authorization code with PKCE, then cache the refresh token in macOS Keychain.",
+    inputSchema: objectSchema({
+      clientId: stringProp("Microsoft Entra application client ID. Defaults to ONENOTE_CLIENT_ID."),
+      tenantId: stringProp("Tenant ID or common/organizations/consumers. Defaults to ONENOTE_TENANT_ID or common."),
+      scopes: stringProp("Space-delimited delegated Graph scopes. Defaults to Notes.ReadWrite offline_access User.Read."),
+      timeoutSeconds: numberProp("Maximum seconds to wait for browser sign-in. Defaults to 180.", 30, 900)
     })
   },
   {
@@ -173,6 +188,10 @@ function tokenEndpoint(tenantId) {
   return `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`;
 }
 
+function authorizeEndpoint(tenantId) {
+  return `https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/authorize`;
+}
+
 async function postForm(url, values) {
   const response = await fetch(url, {
     method: "POST",
@@ -189,6 +208,150 @@ async function postForm(url, values) {
     throw error;
   }
   return payload;
+}
+
+async function browserLogin(args) {
+  const config = authConfig(args);
+  if (!config.clientId) {
+    throw new Error(
+      "Missing Microsoft client ID. Set ONENOTE_CLIENT_ID or pass clientId. The app must allow public client auth with a localhost redirect URI."
+    );
+  }
+
+  const state = randomUrlSafe(32);
+  const verifier = randomUrlSafe(64);
+  const challenge = base64Url(crypto.createHash("sha256").update(verifier).digest());
+  const timeoutSeconds = Math.min(args.timeoutSeconds || DEFAULT_LOGIN_TIMEOUT_SECONDS, 900);
+
+  const loginResult = await withCallbackServer(timeoutSeconds, async ({ redirectUri, waitForCallback }) => {
+    const authUrl = new URL(authorizeEndpoint(config.tenantId));
+    authUrl.searchParams.set("client_id", config.clientId);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("response_mode", "query");
+    authUrl.searchParams.set("scope", config.scopes);
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("code_challenge", challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("prompt", "select_account");
+
+    openBrowser(authUrl.toString());
+    const callback = await waitForCallback();
+    if (callback.error) {
+      throw new Error(callback.errorDescription || callback.error);
+    }
+    if (callback.state !== state) {
+      throw new Error("Microsoft sign-in returned an invalid state value.");
+    }
+
+    const token = await postForm(tokenEndpoint(config.tenantId), {
+      grant_type: "authorization_code",
+      client_id: config.clientId,
+      code: callback.code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+      scope: config.scopes
+    });
+    writeToken(token, config);
+    return {
+      status: "signed_in",
+      scopes: token.scope,
+      expiresAt: new Date(Date.now() + token.expires_in * 1000).toISOString(),
+      tokenStorage: token.refresh_token ? "macOS Keychain" : "metadata only"
+    };
+  });
+
+  unlinkIfExists(PENDING_AUTH_PATH);
+  return loginResult;
+}
+
+async function withCallbackServer(timeoutSeconds, run) {
+  let server;
+  let timeout;
+  let completeCallback;
+  let failCallback;
+  let settled = false;
+
+  const callbackPromise = new Promise((resolve, reject) => {
+    completeCallback = resolve;
+    failCallback = reject;
+  });
+
+  server = http.createServer((request, response) => {
+    try {
+      const requestUrl = new URL(request.url, "http://localhost");
+      if (requestUrl.pathname !== "/") {
+        response.writeHead(404, { "Content-Type": "text/plain" });
+        response.end("Not found");
+        return;
+      }
+
+      const payload = {
+        code: requestUrl.searchParams.get("code"),
+        state: requestUrl.searchParams.get("state"),
+        error: requestUrl.searchParams.get("error"),
+        errorDescription: requestUrl.searchParams.get("error_description")
+      };
+
+      response.writeHead(payload.error ? 400 : 200, { "Content-Type": "text/html" });
+      response.end(callbackHtml(payload.error));
+
+      if (!settled) {
+        settled = true;
+        completeCallback(payload);
+      }
+    } catch (error) {
+      if (!settled) {
+        settled = true;
+        failCallback(error);
+      }
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const { port } = server.address();
+  const redirectUri = `http://localhost:${port}`;
+
+  timeout = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      failCallback(new Error(`Timed out waiting ${timeoutSeconds} seconds for Microsoft sign-in.`));
+    }
+  }, timeoutSeconds * 1000);
+
+  try {
+    return await run({
+      redirectUri,
+      waitForCallback: () => callbackPromise
+    });
+  } finally {
+    clearTimeout(timeout);
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function callbackHtml(isError) {
+  const title = isError ? "OneNote sign-in failed" : "OneNote sign-in complete";
+  const body = isError
+    ? "Microsoft sign-in returned an error. You can close this window and try again from Codex."
+    : "OneNote sign-in is complete. You can close this window and return to Codex.";
+  return `<!doctype html><html><head><title>${title}</title></head><body><h1>${title}</h1><p>${body}</p></body></html>`;
+}
+
+function openBrowser(url) {
+  const command =
+    process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const child = execFile(command, args, { windowsHide: true }, (error) => {
+    if (error) {
+      process.stderr.write(`Unable to open browser automatically: ${error.message}\n`);
+    }
+  });
+  child.unref();
 }
 
 async function startAuth(args) {
@@ -274,51 +437,121 @@ async function completeAuth(args) {
   };
 }
 
-function writeToken(token, config) {
-  writeJson(TOKEN_PATH, {
+function writeToken(token, config, fallbackRefreshToken = null) {
+  const refreshToken = token.refresh_token || fallbackRefreshToken || config.refreshToken || null;
+  if (refreshToken) {
+    storeRefreshToken(config, refreshToken);
+  }
+  const metadata = {
     accessToken: token.access_token,
-    refreshToken: token.refresh_token,
     tokenType: token.token_type,
     scopes: token.scope,
     clientId: config.clientId,
     tenantId: config.tenantId,
-    expiresAt: Date.now() + token.expires_in * 1000
-  });
+    expiresAt: Date.now() + token.expires_in * 1000,
+    refreshTokenStored: Boolean(refreshToken),
+    refreshTokenStorage: keychainSupported() ? "macOS Keychain" : "token.json"
+  };
+  if (!keychainSupported() && refreshToken) {
+    metadata.refreshToken = refreshToken;
+  }
+  writeJson(TOKEN_PATH, metadata);
 }
 
 async function accessToken() {
   const token = readJson(TOKEN_PATH);
   if (!token) {
-    throw new Error("OneNote is not signed in. Run onenote_auth_start and onenote_auth_complete first.");
+    throw new Error("OneNote is not signed in. Run onenote_login first.");
   }
   if (token.expiresAt && Date.now() < token.expiresAt - 120000) {
     return token.accessToken;
   }
-  if (!token.refreshToken || !token.clientId) {
-    throw new Error("Cached OneNote token cannot be refreshed. Run onenote_auth_start again.");
+  const refreshToken = getRefreshToken(token);
+  if (!refreshToken || !token.clientId) {
+    throw new Error("Cached OneNote token cannot be refreshed. Run onenote_login again.");
   }
 
   const refreshed = await postForm(tokenEndpoint(token.tenantId || DEFAULT_TENANT), {
     grant_type: "refresh_token",
     client_id: token.clientId,
-    refresh_token: token.refreshToken,
+    refresh_token: refreshToken,
     scope: token.scopes || DEFAULT_SCOPES
   });
-  writeToken(refreshed, token);
+  writeToken(refreshed, token, refreshToken);
   return refreshed.access_token;
 }
 
 function authStatus() {
   const token = readJson(TOKEN_PATH);
   const pending = readJson(PENDING_AUTH_PATH);
+  const hasRefreshToken = token ? Boolean(getRefreshToken(token)) : false;
   return {
-    signedIn: Boolean(token && token.accessToken),
+    signedIn: Boolean(token && (token.accessToken || hasRefreshToken)),
     expiresAt: token && token.expiresAt ? new Date(token.expiresAt).toISOString() : null,
     scopes: token ? token.scopes : null,
     pendingAuth: Boolean(pending),
     hasClientId: Boolean(process.env.ONENOTE_CLIENT_ID || (pending && pending.clientId) || (token && token.clientId)),
+    hasRefreshToken,
+    tokenStorage: token ? token.refreshTokenStorage || "token.json" : null,
     dataDir: DATA_DIR
   };
+}
+
+function keychainSupported() {
+  return process.platform === "darwin";
+}
+
+function keychainAccount(config) {
+  return `${config.tenantId || DEFAULT_TENANT}:${config.clientId || "unknown"}`;
+}
+
+function storeRefreshToken(config, refreshToken) {
+  if (!keychainSupported()) {
+    config.refreshToken = refreshToken;
+    return;
+  }
+  execFileSync("security", [
+    "add-generic-password",
+    "-a",
+    keychainAccount(config),
+    "-s",
+    KEYCHAIN_SERVICE,
+    "-w",
+    refreshToken,
+    "-U"
+  ]);
+}
+
+function getRefreshToken(config) {
+  if (config.refreshToken) return config.refreshToken;
+  if (!keychainSupported() || !config.clientId) return null;
+  try {
+    return execFileSync("security", [
+      "find-generic-password",
+      "-a",
+      keychainAccount(config),
+      "-s",
+      KEYCHAIN_SERVICE,
+      "-w"
+    ], { encoding: "utf8" }).trim();
+  } catch (_error) {
+    return null;
+  }
+}
+
+function deleteRefreshToken(config) {
+  if (!keychainSupported() || !config || !config.clientId) return;
+  try {
+    execFileSync("security", [
+      "delete-generic-password",
+      "-a",
+      keychainAccount(config),
+      "-s",
+      KEYCHAIN_SERVICE
+    ], { stdio: "ignore" });
+  } catch (_error) {
+    // Ignore missing Keychain items.
+  }
 }
 
 async function graphRequest(method, resource, options = {}) {
@@ -361,7 +594,10 @@ async function callTool(name, args = {}) {
       return startAuth(args);
     case "onenote_auth_complete":
       return completeAuth(args);
+    case "onenote_login":
+      return browserLogin(args);
     case "onenote_clear_auth":
+      deleteRefreshToken(readJson(TOKEN_PATH));
       unlinkIfExists(TOKEN_PATH);
       unlinkIfExists(PENDING_AUTH_PATH);
       return { cleared: true };
@@ -478,6 +714,18 @@ function escapeAttr(value) {
 function truncate(value, maxChars) {
   const text = String(value);
   return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+function randomUrlSafe(bytes) {
+  return base64Url(crypto.randomBytes(bytes));
+}
+
+function base64Url(buffer) {
+  return Buffer.from(buffer)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function sleep(ms) {
