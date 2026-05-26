@@ -10,6 +10,17 @@ This plugin gives Codex delegated Microsoft Graph tools for OneNote:
 - Create structured pages from HTML.
 - Append or patch existing pages.
 
+## Install from Codex
+
+Add this repository as a Codex plugin marketplace:
+
+```sh
+codex plugin marketplace add Nu11ified/onenote-plugin
+codex plugin marketplace upgrade onenote-plugin
+```
+
+Then restart Codex, open Plugins, select the OneNote Plugin marketplace, and install `onenote-plugin`.
+
 ## Setup
 
 Create a Microsoft Entra app registration configured as a public client, then grant delegated Microsoft Graph permissions:

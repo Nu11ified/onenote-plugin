@@ -1,7 +1,7 @@
 {
-  "name": "onenote-plugin-local",
+  "name": "onenote-plugin",
   "interface": {
-    "displayName": "Local OneNote Plugin"
+    "displayName": "OneNote Plugin"
   },
   "plugins": [
     {
